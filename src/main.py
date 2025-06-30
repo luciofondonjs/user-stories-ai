@@ -5,6 +5,12 @@ import cv2
 from PIL import Image
 import google.generativeai as genai
 from dotenv import load_dotenv
+import json
+import glob
+from datetime import datetime
+
+FRAME_INTERVAL = 2  # segundos entre frames extraídos
+MAX_FRAMES = 8      # máximo de frames a analizar para no exceder el límite de la API
 
 # Cargar la API KEY de Gemini desde .env
 load_dotenv()
@@ -162,7 +168,7 @@ Rewrite the visual analysis into a complete, professional user story, following 
 
 default_gemini_models = [
     "gemini-1.5-flash",
-    "gemini-1.5-pro"
+    "gemini-2.5-pro",
 ]
 
 with st.expander("Mostrar/editar prompt avanzado para la IA", expanded=False):
@@ -177,19 +183,93 @@ selected_model = st.selectbox(
     help="Puedes elegir entre los modelos disponibles de Google Gemini Vision."
 )
 
-uploaded_file = st.file_uploader("Sube un video (mp4, mov, avi)", type=["mp4", "mov", "avi"])
+st.sidebar.title("Modo de uso")
+modo = st.sidebar.radio("Selecciona el modo de uso:", ["Subir video manualmente", "Procesar carpeta completa"], index=0)
 
-FRAME_INTERVAL = 2  # segundos entre frames extraídos
-MAX_FRAMES = 8      # máximo de frames a analizar para no exceder el límite de la API
+# Información adicional en el sidebar
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 💡 Información útil")
 
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmpfile:
-        tmpfile.write(uploaded_file.read())
-        video_path = tmpfile.name
+if modo == "Subir video manualmente":
+    st.sidebar.info("""
+    **Modo manual:**
+    - Sube un video individual
+    - Se verifica automáticamente si ya existe HDU
+    - Opción de cargar existente o reprocesar
+    - Ideal para videos específicos
+    """)
+else:
+    st.sidebar.info("""
+    **Modo masivo:**
+    - Procesa todos los videos de una carpeta
+    - Evita reprocesar videos con HDU existente
+    - Opción de forzar reprocesamiento
+    - Ideal para lotes grandes
+    """)
 
-    st.video(video_path)
-    st.info("Extrayendo frames del video...")
+st.sidebar.markdown("### 💰 Ahorro de costos")
+st.sidebar.success("""
+✅ **Beneficios:**
+- Evita reprocesar videos ya analizados
+- Reduce costos de API de Gemini
+- Ahorra tiempo de procesamiento
+- Mantiene consistencia en análisis
+""")
 
+st.sidebar.markdown("### 📁 Archivos generados")
+st.sidebar.info("""
+Para cada video se crean:
+- `video_HDU.txt` - Historia de usuario
+- `video_HDU.json` - Metadatos del análisis
+""")
+
+# Función para verificar si ya existe HDU para un video
+def verificar_hdu_existente(video_path):
+    """Verifica si ya existen archivos HDU para el video dado"""
+    base_path = os.path.splitext(video_path)[0]
+    txt_path = base_path + "_HDU.txt"
+    json_path = base_path + "_HDU.json"
+    return os.path.exists(txt_path) and os.path.exists(json_path), txt_path, json_path
+
+# Función para cargar HDU existente
+def cargar_hdu_existente(video_path):
+    """Carga una HDU existente desde los archivos guardados"""
+    base_path = os.path.splitext(video_path)[0]
+    txt_path = base_path + "_HDU.txt"
+    json_path = base_path + "_HDU.json"
+    
+    try:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            hdu_text = f.read()
+        with open(json_path, "r", encoding="utf-8") as f:
+            hdu_json = json.load(f)
+        return hdu_text, hdu_json, None
+    except Exception as e:
+        return None, None, f"Error al cargar HDU existente: {str(e)}"
+
+# Función para guardar HDU
+def guardar_hdu(video_path, hdu_text, hdu_json):
+    base_path = os.path.splitext(video_path)[0]
+    txt_path = base_path + "_HDU.txt"
+    json_path = base_path + "_HDU.json"
+    # Avisar si existen
+    avisos = []
+    if os.path.exists(txt_path):
+        avisos.append(f"⚠️ Se sobreescribirá: {txt_path}")
+    if os.path.exists(json_path):
+        avisos.append(f"⚠️ Se sobreescribirá: {json_path}")
+    for aviso in avisos:
+        st.warning(aviso)
+    # Guardar archivos
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(hdu_text)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(hdu_json, f, ensure_ascii=False, indent=2)
+    return txt_path, json_path
+
+# Función para procesar un video y devolver HDU
+@st.cache_data(show_spinner=False)
+def procesar_video(video_path, prompt, extra_context, selected_model):
     # Extraer frames
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -210,25 +290,281 @@ if uploaded_file:
             if count >= MAX_FRAMES:
                 break
     cap.release()
-
-    st.write(f"Se extrajeron {len(frames)} frames para análisis IA.")
-    st.image(frames, caption=[f"Frame {i+1} ({t}s)" for i, t in enumerate(timestamps)], width=180)
-
-    if st.button("Analizar video y generar historia de usuario"):
-        st.info("Enviando frames a Gemini Vision para análisis global del video...")
-        vision_model = genai.GenerativeModel(selected_model)
-        # Construir el prompt para análisis global
-        global_prompt = (
-            (extra_context + "\n\n" if extra_context.strip() else "") +
-            prompt +
-            "\n\nAnalyze the following sequence of app screens (frames extracted from a video) as a whole. "
-            "Describe the user flow, main actions, UI elements, and any relevant details you observe. "
-            "Then, based on this visual analysis, generate a single, complete, professional user story following all the guidelines."
-        )
-        # Enviar todos los frames juntos
+    if not frames:
+        return None, None, "No se pudieron extraer frames."
+    # Construir prompt
+    global_prompt = (
+        (extra_context + "\n\n" if extra_context.strip() else "") +
+        prompt +
+        "\n\nAnalyze the following sequence of app screens (frames extracted from a video) as a whole. "
+        "Describe the user flow, main actions, UI elements, and any relevant details you observe. "
+        "Then, based on this visual analysis, generate a single, complete, professional user story following all the guidelines."
+    )
+    vision_model = genai.GenerativeModel(selected_model)
+    try:
         response = vision_model.generate_content([
             global_prompt,
             *frames
         ])
-        st.success("Historia de usuario generada para el video completo:")
-        st.markdown(response.text) 
+        hdu_text = response.text
+        hdu_json = {
+            "video": os.path.basename(video_path),
+            "ruta": video_path,
+            "timestamp": datetime.now().isoformat(),
+            "modelo": selected_model,
+            "prompt": prompt,
+            "extra_context": extra_context,
+            "hdu": hdu_text
+        }
+        return hdu_text, hdu_json, None
+    except Exception as e:
+        return None, None, str(e)
+
+# Función para obtener información de HDU existente
+def obtener_info_hdu_existente(video_path):
+    """Obtiene información detallada de una HDU existente"""
+    base_path = os.path.splitext(video_path)[0]
+    json_path = base_path + "_HDU.json"
+    
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            hdu_json = json.load(f)
+        
+        info = {
+            "video": hdu_json.get("video", "N/A"),
+            "modelo": hdu_json.get("modelo", "N/A"),
+            "timestamp": hdu_json.get("timestamp", "N/A"),
+            "ruta": hdu_json.get("ruta", "N/A")
+        }
+        return info, None
+    except Exception as e:
+        return None, f"Error al leer información de HDU: {str(e)}"
+
+if modo == "Subir video manualmente":
+    uploaded_file = st.file_uploader("Sube un video (mp4, mov, avi)", type=["mp4", "mov", "avi"])
+    if uploaded_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmpfile:
+            tmpfile.write(uploaded_file.read())
+            video_path = tmpfile.name
+        
+        st.video(video_path)
+        
+        # Verificar si ya existe HDU para este video
+        existe_hdu, txt_path, json_path = verificar_hdu_existente(video_path)
+        
+        if existe_hdu:
+            st.success("✅ Se encontró una HDU existente para este video.")
+            st.info("Para evitar costos adicionales, se cargará la HDU existente en lugar de reprocesar el video.")
+            
+            # Mostrar información de la HDU existente
+            info_hdu, error_info = obtener_info_hdu_existente(video_path)
+            if info_hdu and not error_info:
+                with st.expander("📋 Información de la HDU existente", expanded=True):
+                    st.write(f"**Video:** {info_hdu['video']}")
+                    st.write(f"**Modelo usado:** {info_hdu['modelo']}")
+                    st.write(f"**Fecha de generación:** {info_hdu['timestamp']}")
+                    st.write(f"**Archivos:** {txt_path}, {json_path}")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📖 Cargar HDU existente"):
+                    hdu_text, hdu_json, error = cargar_hdu_existente(video_path)
+                    if error:
+                        st.error(f"Error: {error}")
+                    else:
+                        st.success("Historia de usuario cargada desde archivo existente:")
+                        st.markdown(hdu_text)
+                        st.info(f"Archivos HDU:\n- {txt_path}\n- {json_path}")
+            
+            with col2:
+                if st.button("🔄 Reprocesar video (costos adicionales)"):
+                    st.warning("⚠️ Se procederá a reprocesar el video. Esto generará costos adicionales en la API.")
+                    # Continuar con el procesamiento normal
+                    st.info("Extrayendo frames del video...")
+                    cap = cv2.VideoCapture(video_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    duration = total_frames / fps if fps else 0
+                    frames = []
+                    timestamps = []
+                    count = 0
+                    for sec in range(0, int(duration), FRAME_INTERVAL):
+                        cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
+                        ret, frame = cap.read()
+                        if ret:
+                            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            pil_img = Image.fromarray(img)
+                            frames.append(pil_img)
+                            timestamps.append(sec)
+                            count += 1
+                            if count >= MAX_FRAMES:
+                                break
+                    cap.release()
+                    st.write(f"Se extrajeron {len(frames)} frames para análisis IA.")
+                    st.image(frames, caption=[f"Frame {i+1} ({t}s)" for i, t in enumerate(timestamps)], width=180)
+                    
+                    if st.button("✅ Confirmar reprocesamiento"):
+                        st.info("Enviando frames a Gemini Vision para análisis global del video...")
+                        hdu_text, hdu_json, error = procesar_video(video_path, prompt, extra_context, selected_model)
+                        if error:
+                            st.error(f"Error: {error}")
+                        else:
+                            st.success("Historia de usuario regenerada para el video:")
+                            st.markdown(hdu_text)
+                            # Guardar archivos en la carpeta temporal
+                            txt_path, json_path = guardar_hdu(video_path, hdu_text, hdu_json)
+                            st.info(f"Archivos guardados:\n- {txt_path}\n- {json_path}")
+        else:
+            # No existe HDU, procesar normalmente
+            st.info("Extrayendo frames del video...")
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps else 0
+            frames = []
+            timestamps = []
+            count = 0
+            for sec in range(0, int(duration), FRAME_INTERVAL):
+                cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
+                ret, frame = cap.read()
+                if ret:
+                    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(img)
+                    frames.append(pil_img)
+                    timestamps.append(sec)
+                    count += 1
+                    if count >= MAX_FRAMES:
+                        break
+            cap.release()
+            st.write(f"Se extrajeron {len(frames)} frames para análisis IA.")
+            st.image(frames, caption=[f"Frame {i+1} ({t}s)" for i, t in enumerate(timestamps)], width=180)
+            if st.button("Analizar video y generar historia de usuario"):
+                st.info("Enviando frames a Gemini Vision para análisis global del video...")
+                hdu_text, hdu_json, error = procesar_video(video_path, prompt, extra_context, selected_model)
+                if error:
+                    st.error(f"Error: {error}")
+                else:
+                    st.success("Historia de usuario generada para el video completo:")
+                    st.markdown(hdu_text)
+                    # Guardar archivos en la carpeta temporal
+                    txt_path, json_path = guardar_hdu(video_path, hdu_text, hdu_json)
+                    st.info(f"Archivos guardados:\n- {txt_path}\n- {json_path}")
+
+elif modo == "Procesar carpeta completa":
+    st.write("### Procesamiento masivo de videos en carpeta")
+    carpeta = st.text_input("Ruta absoluta de la carpeta a procesar:", value="")
+    
+    # Opciones de procesamiento
+    st.write("#### Opciones de procesamiento:")
+    procesar_existentes = st.checkbox("Reprocesar videos que ya tienen HDU (genera costos adicionales)", value=False)
+    mostrar_resumen = st.checkbox("Mostrar resumen de videos encontrados", value=True)
+    
+    if carpeta:
+        if not os.path.isdir(carpeta):
+            st.error("La ruta ingresada no es una carpeta válida.")
+        else:
+            patrones = ["**/*.mp4", "**/*.mov", "**/*.avi"]
+            lista_videos = []
+            for patron in patrones:
+                lista_videos.extend(glob.glob(os.path.join(carpeta, patron), recursive=True))
+            
+            if not lista_videos:
+                st.warning("No se encontraron videos en la carpeta seleccionada.")
+            else:
+                # Analizar qué videos ya tienen HDU
+                videos_con_hdu = []
+                videos_sin_hdu = []
+                
+                for video_path in lista_videos:
+                    existe_hdu, _, _ = verificar_hdu_existente(video_path)
+                    if existe_hdu:
+                        videos_con_hdu.append(video_path)
+                    else:
+                        videos_sin_hdu.append(video_path)
+                
+                if mostrar_resumen:
+                    st.write(f"📊 **Resumen de videos encontrados:**")
+                    st.write(f"- Total de videos: {len(lista_videos)}")
+                    st.write(f"- Videos con HDU existente: {len(videos_con_hdu)}")
+                    st.write(f"- Videos sin HDU: {len(videos_sin_hdu)}")
+                    
+                    if videos_con_hdu:
+                        st.write("**Videos con HDU existente:**")
+                        for video in videos_con_hdu:
+                            st.write(f"  ✅ {os.path.basename(video)}")
+                    
+                    if videos_sin_hdu:
+                        st.write("**Videos sin HDU:**")
+                        for video in videos_sin_hdu:
+                            st.write(f"  ⏳ {os.path.basename(video)}")
+                
+                # Determinar qué videos procesar
+                videos_a_procesar = []
+                if procesar_existentes:
+                    videos_a_procesar = lista_videos
+                    st.warning(f"⚠️ Se procesarán TODOS los {len(lista_videos)} videos (incluyendo {len(videos_con_hdu)} con HDU existente)")
+                else:
+                    videos_a_procesar = videos_sin_hdu
+                    st.success(f"✅ Se procesarán solo los {len(videos_sin_hdu)} videos sin HDU existente")
+                
+                if videos_a_procesar:
+                    if st.button(f"🚀 Iniciar procesamiento de {len(videos_a_procesar)} videos"):
+                        st.write(f"Procesando {len(videos_a_procesar)} videos...")
+                        log_lines = []
+                        progreso = st.progress(0)
+                        videos_procesados = 0
+                        videos_omitidos = 0
+                        errores = 0
+                        
+                        for idx, video_path in enumerate(videos_a_procesar):
+                            existe_hdu, _, _ = verificar_hdu_existente(video_path)
+                            
+                            if existe_hdu and not procesar_existentes:
+                                st.write(f"⏭️ Omitiendo (HDU existente): {os.path.basename(video_path)}")
+                                log_lines.append(f"OMITIDO: {video_path} - HDU existente")
+                                videos_omitidos += 1
+                                continue
+                            
+                            st.write(f"🔄 Procesando: {os.path.basename(video_path)}")
+                            
+                            if existe_hdu and procesar_existentes:
+                                st.write(f"  ⚠️ Reprocesando video con HDU existente")
+                            
+                            hdu_text, hdu_json, error = procesar_video(video_path, prompt, extra_context, selected_model)
+                            
+                            if error:
+                                st.error(f"❌ Error en {os.path.basename(video_path)}: {error}")
+                                log_lines.append(f"ERROR: {video_path}: {error}")
+                                errores += 1
+                                continue
+                            
+                            txt_path, json_path = guardar_hdu(video_path, hdu_text, hdu_json)
+                            st.success(f"✅ HDU generada para {os.path.basename(video_path)}")
+                            log_lines.append(f"OK: {video_path} -> {txt_path}, {json_path}")
+                            videos_procesados += 1
+                            progreso.progress((idx+1)/len(videos_a_procesar))
+                        
+                        # Resumen final
+                        st.write("---")
+                        st.write("📋 **Resumen del procesamiento:**")
+                        st.write(f"- Videos procesados: {videos_procesados}")
+                        st.write(f"- Videos omitidos: {videos_omitidos}")
+                        st.write(f"- Errores: {errores}")
+                        
+                        # Guardar log
+                        log_path = os.path.join(carpeta, f"procesamiento_hdu_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                        with open(log_path, "w", encoding="utf-8") as flog:
+                            flog.write(f"Resumen del procesamiento:\n")
+                            flog.write(f"- Videos procesados: {videos_procesados}\n")
+                            flog.write(f"- Videos omitidos: {videos_omitidos}\n")
+                            flog.write(f"- Errores: {errores}\n")
+                            flog.write(f"- Total de videos encontrados: {len(lista_videos)}\n")
+                            flog.write(f"- Videos con HDU existente: {len(videos_con_hdu)}\n")
+                            flog.write(f"- Videos sin HDU: {len(videos_sin_hdu)}\n")
+                            flog.write(f"- Reprocesar existentes: {procesar_existentes}\n\n")
+                            flog.write("Detalle por video:\n")
+                            flog.write("\n".join(log_lines))
+                        
+                        st.info(f"📄 Log guardado en: {log_path}")
+                else:
+                    st.info("No hay videos para procesar con la configuración actual.") 

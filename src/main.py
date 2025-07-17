@@ -9,8 +9,25 @@ import json
 import glob
 from datetime import datetime
 
-FRAME_INTERVAL = 2  # segundos entre frames extraídos
-MAX_FRAMES = 8      # máximo de frames a analizar para no exceder el límite de la API
+# Función para calcular parámetros óptimos según la duración del video
+def calcular_parametros_video(video_path):
+    """Calcula parámetros óptimos para el video basado en su duración"""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps else 0
+    cap.release()
+    
+    # Estrategia adaptativa
+    if duration <= 30:
+        return 2, 8, "Detalle alto (video corto ≤30s)"
+    elif duration <= 60:
+        return 8, 8, "Balance medio (video mediano 30-60s)"
+    elif duration <= 120:
+        return 15, 8, "Cobertura completa (video largo 1-2min)"
+    else:
+        interval = max(int(duration / 8), 10)  # Mínimo 10 seg entre frames
+        return interval, 8, f"Distribución uniforme (video muy largo: {duration:.1f}s)"
 
 # Cargar la API KEY de Gemini desde .env
 load_dotenv()
@@ -223,6 +240,16 @@ Para cada video se crean:
 - `video_HDU.json` - Metadatos del análisis
 """)
 
+st.sidebar.markdown("### 🧠 Estrategia Adaptativa")
+st.sidebar.success("""
+🎯 **Nueva funcionalidad:**
+- Videos ≤30s: Detalle alto (2s entre frames)
+- Videos 30-60s: Balance medio (8s entre frames)  
+- Videos 1-2min: Cobertura completa (15s entre frames)
+- Videos >2min: Distribución uniforme
+- Máximo 8 frames para optimizar costos API
+""")
+
 # Función para verificar si ya existe HDU para un video
 def verificar_hdu_existente(video_path):
     """Verifica si ya existen archivos HDU para el video dado"""
@@ -270,15 +297,30 @@ def guardar_hdu(video_path, hdu_text, hdu_json):
 # Función para procesar un video y devolver HDU
 @st.cache_data(show_spinner=False)
 def procesar_video(video_path, prompt, extra_context, selected_model):
+    # Calcular parámetros óptimos para este video
+    frame_interval, max_frames, estrategia = calcular_parametros_video(video_path)
+    
+    # Mostrar información de la estrategia en Streamlit
+    st.info(f"📊 **Estrategia adaptativa:** {estrategia}")
+    st.info(f"   • Intervalo entre frames: {frame_interval} segundos")
+    st.info(f"   • Máximo de frames: {max_frames}")
+    
     # Extraer frames
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps else 0
+    
+    # Mostrar información del video
+    st.info(f"📹 **Video:** {os.path.basename(video_path)}")
+    st.info(f"   • Duración: {duration:.1f} segundos")
+    st.info(f"   • FPS: {fps:.1f}")
+    st.info(f"   • Cobertura estimada: {frame_interval * max_frames} segundos")
+    
     frames = []
     timestamps = []
     count = 0
-    for sec in range(0, int(duration), FRAME_INTERVAL):
+    for sec in range(0, int(duration), frame_interval):
         cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
         ret, frame = cap.read()
         if ret:
@@ -287,7 +329,7 @@ def procesar_video(video_path, prompt, extra_context, selected_model):
             frames.append(pil_img)
             timestamps.append(sec)
             count += 1
-            if count >= MAX_FRAMES:
+            if count >= max_frames:
                 break
     cap.release()
     if not frames:
@@ -381,6 +423,11 @@ if modo == "Subir video manualmente":
                     st.warning("⚠️ Se procederá a reprocesar el video. Esto generará costos adicionales en la API.")
                     # Continuar con el procesamiento normal
                     st.info("Extrayendo frames del video...")
+                    
+                    # Calcular parámetros óptimos para este video
+                    frame_interval, max_frames, estrategia = calcular_parametros_video(video_path)
+                    st.info(f"📊 **Estrategia adaptativa:** {estrategia}")
+                    
                     cap = cv2.VideoCapture(video_path)
                     fps = cap.get(cv2.CAP_PROP_FPS)
                     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -388,7 +435,7 @@ if modo == "Subir video manualmente":
                     frames = []
                     timestamps = []
                     count = 0
-                    for sec in range(0, int(duration), FRAME_INTERVAL):
+                    for sec in range(0, int(duration), frame_interval):
                         cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
                         ret, frame = cap.read()
                         if ret:
@@ -397,7 +444,7 @@ if modo == "Subir video manualmente":
                             frames.append(pil_img)
                             timestamps.append(sec)
                             count += 1
-                            if count >= MAX_FRAMES:
+                            if count >= max_frames:
                                 break
                     cap.release()
                     st.write(f"Se extrajeron {len(frames)} frames para análisis IA.")
@@ -417,6 +464,11 @@ if modo == "Subir video manualmente":
         else:
             # No existe HDU, procesar normalmente
             st.info("Extrayendo frames del video...")
+            
+            # Calcular parámetros óptimos para este video
+            frame_interval, max_frames, estrategia = calcular_parametros_video(video_path)
+            st.info(f"📊 **Estrategia adaptativa:** {estrategia}")
+            
             cap = cv2.VideoCapture(video_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -424,7 +476,7 @@ if modo == "Subir video manualmente":
             frames = []
             timestamps = []
             count = 0
-            for sec in range(0, int(duration), FRAME_INTERVAL):
+            for sec in range(0, int(duration), frame_interval):
                 cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
                 ret, frame = cap.read()
                 if ret:
@@ -433,7 +485,7 @@ if modo == "Subir video manualmente":
                     frames.append(pil_img)
                     timestamps.append(sec)
                     count += 1
-                    if count >= MAX_FRAMES:
+                    if count >= max_frames:
                         break
             cap.release()
             st.write(f"Se extrajeron {len(frames)} frames para análisis IA.")
